@@ -1,6 +1,6 @@
 ---
 name: douyin-fetch
-description: 获取/下载抖音（Douyin）视频：按视频 ID、网页链接或分享文案下载无水印原视频，抓取首页推荐流，按关键词搜索视频，并输出标题、作者、时长、分辨率、点赞等元数据 JSON。Use when the user wants to download Douyin videos, fetch Douyin video info, browse the Douyin feed, or search Douyin by keyword (e.g. 下载抖音视频、抖音素材、抖音搜索、douyin.com/video 链接、v.douyin.com 分享链接).
+description: 获取/下载抖音（Douyin）视频：按视频 ID、网页链接或分享文案下载无水印原视频，抓取首页推荐流，按关键词搜索视频（不登录，经必应视频索引），并输出标题、作者、时长、分辨率、点赞等元数据 JSON。Use when the user wants to download Douyin videos, fetch Douyin video info, browse the Douyin feed, or search Douyin by keyword (e.g. 下载抖音视频、抖音素材、抖音搜索、douyin.com/video 链接、v.douyin.com 分享链接).
 ---
 
 # 抖音视频获取
@@ -21,7 +21,8 @@ description: 获取/下载抖音（Douyin）视频：按视频 ID、网页链接
 ```bash
 node douyin.mjs video <ID | 链接 | 分享文案> [更多...]          # 下载指定视频（默认全部下载）
 node douyin.mjs feed   [--limit 20] [--download N]               # 首页推荐流，下载前 N 条
-node douyin.mjs search <关键词> [--limit 20] [--download N] [--headful]
+node douyin.mjs websearch <关键词> [--limit 20] [--download N] [--loose]   # 关键词搜索，不需要登录（推荐）
+node douyin.mjs search <关键词> [--limit 20] [--download N] [--headful]    # 抖音站内搜索，需要登录
 ```
 
 通用选项：
@@ -31,9 +32,23 @@ node douyin.mjs search <关键词> [--limit 20] [--download N] [--headful]
 | `--out <目录>` | 输出目录，默认当前目录下的 `douyin_output/` |
 | `--profile <目录>` | Chrome 配置目录，默认 `~/.douyin-fetch/chrome-profile`，保存验证/登录状态 |
 | `--headful` | 显示浏览器窗口（用于人工过验证码 / 扫码登录） |
+| `--loose` | websearch 不按标题过滤关键词（默认只保留标题包含全部关键词的结果） |
 | `--port <端口>` | CDP 调试端口，默认 9333 |
 
 `video` 模式接受的输入：纯数字 ID、`douyin.com/video/<id>`、带 `modal_id=<id>` 的链接、`v.douyin.com/xxx` 短链，或整段分享文案（会自动从中提取链接）。
+
+## 关键词搜索：优先用 websearch
+
+抖音站内搜索**必须登录**（2026-10 实测）：直接打开搜索网址会跳到验证码页；从首页搜索框搜索或打开 `/jingxuan/search/`，会弹出没有关闭按钮的"登录后即可搜索"弹窗。
+
+`websearch` 模式不需要登录，流程如下：
+
+1. 打开必应视频搜索 `<关键词> 抖音`，从结果卡片中取出抖音视频链接和标题。一次通常能拿到 40～100 多条。
+2. 按标题过滤关键词。多个关键词用空格分隔，要求全部命中；加 `--loose` 则不过滤。
+3. 逐条打开抖音视频页核实。搜索引擎的索引有滞后，常有一部分视频已删除，这些会被跳过并打印原因。
+4. 凑够 `--limit` 条后停止，结果交给通用的输出和下载流程。
+
+局限：结果取决于必应的收录，偏向较老、较热门的视频，不等同于抖音站内的排序，也不支持按时间或热度筛选。每条核实要打开一次视频页，大约 3～5 秒，`--limit` 设得越大越慢。其他搜索引擎实测效果都不如必应视频：百度网页约 10 条，360 只有个位数，Google、搜狗、DuckDuckGo、必应网页都是 0 条。
 
 ## 输出
 
@@ -43,8 +58,8 @@ node douyin.mjs search <关键词> [--limit 20] [--download N] [--headful]
 
 ## 验证码
 
-- `video` 和 `feed` 在无头模式下通常不会触发验证码。
-- **`search` 页面在无头模式下会被拦到"验证码中间页"**。处理方式：让用户自己用 `--headful` 跑一次，在弹出的 Chrome 窗口里**手动**完成验证或扫码登录（脚本最多等 180 秒），状态会存进 profile 目录，之后再去掉 `--headful`。
+- `video`、`feed`、`websearch` 在无头模式下通常不会触发验证码。
+- **`search`（站内搜索）不登录会被拦到"验证码中间页"或登录弹窗**。用户不想登录时，改用 `websearch`。处理方式：让用户自己用 `--headful` 跑一次，在弹出的 Chrome 窗口里**手动**完成验证或扫码登录（脚本最多等 180 秒），状态会存进 profile 目录，之后再去掉 `--headful`。
 - `--headful` 需要用户在电脑前操作，执行前先告诉用户会弹出窗口、需要做什么。
 - **不要**接入打码平台或写代码自动破解验证码。
 - 没拿到数据时，脚本会把页面截图存到输出目录，先看截图判断原因。
@@ -52,6 +67,7 @@ node douyin.mjs search <关键词> [--limit 20] [--download N] [--headful]
 ## 注意事项
 
 - 抖音首页"精选"推荐里有大量 40 分钟以上的长视频，1080p 单个文件可能超过 1GB。批量下载前先列出（不加 `--download`），看一下 `duration_s` 再决定下载哪些。
+- 视频页打开了不代表视频还在：已删除的视频页面会显示其他推荐内容的标题。判断是否可用要看 detail 接口的 `filter_detail`，脚本已经处理了这一点。
 - 视频直链有时效，过期后要重新运行脚本获取，不要保存直链留着以后再用。
 - 长视频下载会花不少时间，用 Bash 运行时把超时设大一些，或者放到后台运行。
 - 同一时间只运行一个实例：多个实例会抢同一个 profile 目录和调试端口。确实需要并行时，换 `--port` 和 `--profile`。

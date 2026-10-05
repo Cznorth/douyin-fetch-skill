@@ -3,14 +3,16 @@
 // 用法（需要 Node >= 22 和 Google Chrome / Chromium；WSL 里用 Windows 的 node.exe）:
 //   node douyin.mjs video <ID | 链接 | 分享文案> ...   下载指定视频
 //   node douyin.mjs feed   [--limit 20] [--download N]  首页推荐流
-//   node douyin.mjs search <关键词> [--limit 20] [--download N] [--headful]
+//   node douyin.mjs websearch <关键词> [--limit 20] [--download N] [--loose]  不登录搜索（经必应视频索引）
+//   node douyin.mjs search <关键词> [--limit 20] [--download N] [--headful]  抖音站内搜索（需登录）
 // 通用选项:
 //   --out <目录>      输出目录（默认 ./douyin_output）
 //   --profile <目录>  Chrome 配置目录（默认 ~/.douyin-fetch/chrome-profile，保存验证/登录状态）
 //   --headful         显示浏览器窗口，用于手动过验证码/扫码登录
+//   --loose           websearch 不按标题过滤关键词
 //
-// search 页会触发验证码：先加 --headful 跑一次，在弹出的窗口里手动过验证/扫码登录，
-// 状态保存在 profile 目录，之后可去掉 --headful。
+// search 是抖音站内搜索，不登录会被验证码/登录弹窗拦住：先加 --headful 跑一次，在弹出的窗口里
+// 手动过验证/扫码登录，状态保存在 profile 目录，之后可去掉 --headful。不想登录就用 websearch。
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,6 +27,7 @@ const opt = name => {
   return i < 0 ? undefined : rest[i + 1];
 };
 const headful = rest.includes('--headful');
+const loose = rest.includes('--loose');
 const limit = Number(opt('--limit') ?? 20);
 const downloadN = Number(opt('--download') ?? (mode === 'video' ? Infinity : 0));
 const positional = rest.filter((a, i) => !a.startsWith('--') && !VALUE_FLAGS.includes(rest[i - 1]));
@@ -126,6 +129,7 @@ async function openBrowser() {
     send,
     goto: url => send('Page.navigate', { url }),
     title: async () => (await send('Runtime.evaluate', { expression: 'document.title' })).result.value,
+    evaluate: async expression => (await send('Runtime.evaluate', { expression, returnByValue: true })).result.value,
     scroll: () => send('Runtime.evaluate', { expression: 'window.scrollBy(0, 3000)' }),
     screenshot: async file => {
       const s = await send('Page.captureScreenshot', { format: 'png' });
@@ -164,13 +168,13 @@ function collect(responses, urlFilter = () => true) {
 // 选清晰度：优先 H.264（剪辑软件兼容性最好），同编码取最高码率
 function pickSource(a) {
   const v = a.video;
-  const rates = (v.bit_rate || []).filter(b => b.play_addr?.url_list?.length);
+  const rates = (v?.bit_rate || []).filter(b => b.play_addr?.url_list?.length);
   rates.sort((x, y) => (x.is_h265 - y.is_h265) || (y.bit_rate - x.bit_rate));
   const best = rates[0];
   return {
-    urls: best ? best.play_addr.url_list : v.play_addr.url_list,
-    width: best?.play_addr?.width ?? v.width,
-    height: best?.play_addr?.height ?? v.height,
+    urls: best ? best.play_addr.url_list : (v?.play_addr?.url_list || []),
+    width: best?.play_addr?.width ?? v?.width,
+    height: best?.play_addr?.height ?? v?.height,
     codec: best ? (best.is_h265 ? 'h265' : 'h264') : 'unknown',
   };
 }
@@ -253,15 +257,76 @@ async function listPage(b, url, urlFilter, label) {
   return [...map.values()].slice(0, limit);
 }
 
+// 已删除/无权限的视频页面仍会正常打开（标题是推荐内容的），要看 detail 接口的 filter_detail 判断
 async function fetchDetail(b, id) {
   b.responses.length = 0;
   await b.goto(`https://www.douyin.com/video/${id}`);
   for (let i = 0; i < 20; i++) {
     await sleep(1000);
-    const hit = collect(b.responses, u => u.includes('/aweme/detail')).get(id);
-    if (hit) return hit;
+    for (const r of b.responses) {
+      if (!r.url.includes('/aweme/detail')) continue;
+      let j;
+      try { j = JSON.parse(r.text); } catch { continue; }
+      if (j.aweme_detail?.aweme_id === id) return j.aweme_detail;
+      if (j.filter_detail?.aweme_id === id) {
+        throw new Error(`视频 ${id} 不可用: ${j.filter_detail.detail_msg || j.filter_detail.filter_reason || '已删除或无权限'}`);
+      }
+    }
   }
   throw new Error(`视频 ${id} 未拿到详情（页面标题: ${await b.title()}）`);
+}
+
+// 抖音站内搜索必须登录，改从必应视频搜索的索引里找抖音链接。
+// 必应结果卡片的 vrhm / mmeta 属性是 JSON，murl 为原始链接、vt 为标题。
+const BING_COLLECT = `(() => {
+  const items = new Map();
+  for (const el of document.querySelectorAll('[vrhm], [mmeta]')) {
+    let j;
+    try { j = JSON.parse(el.getAttribute('vrhm') || el.getAttribute('mmeta')); } catch { continue; }
+    const m = (j.murl || j.pgurl || '').match(/douyin\\.com\\/video\\/(\\d{15,})/);
+    if (m && !items.get(m[1])) items.set(m[1], j.vt || j.title || '');
+  }
+  return [...items].map(([id, title]) => ({ id, title }));
+})()`;
+
+async function bingCandidates(b, kw, want) {
+  const url = `https://www.bing.com/videos/search?q=${encodeURIComponent(`${kw} 抖音`)}`;
+  console.log('打开', url);
+  await b.goto(url);
+  await sleep(5000);
+  let found = [];
+  for (let i = 0, stale = 0; i < 15 && found.length < want && stale < 2; i++) {
+    const before = found.length;
+    found = await b.evaluate(BING_COLLECT);
+    stale = found.length === before ? stale + 1 : 0;
+    await b.scroll();
+    await sleep(2000);
+  }
+  if (!found.length) {
+    await b.screenshot(path.join(outDir, 'websearch_page.png'));
+    console.log(`必应没有返回抖音结果。页面标题: ${await b.title()}，截图: ${path.join(outDir, 'websearch_page.png')}`);
+  }
+  return found;
+}
+
+async function webSearch(b, kw) {
+  const cands = await bingCandidates(b, kw, limit * 3);
+  const terms = kw.toLowerCase().split(/\s+/).filter(Boolean);
+  const picked = loose ? cands : cands.filter(c => terms.every(t => c.title.toLowerCase().includes(t)));
+  console.log(`必应找到 ${cands.length} 个抖音链接，${loose ? '' : `标题含关键词的 ${picked.length} 个，`}逐条去抖音核实（索引有滞后，部分已删除）…`);
+  const awemes = [];
+  let dead = 0;
+  for (const c of picked) {
+    if (awemes.length >= limit) break;
+    try {
+      awemes.push(await fetchDetail(b, c.id));
+    } catch (e) {
+      dead++;
+      console.log(`  跳过 ${e.message}`);
+    }
+  }
+  console.log(`核实完成：可用 ${awemes.length}，跳过 ${dead}`);
+  return awemes;
 }
 
 const b = await openBrowser();
@@ -277,13 +342,17 @@ try {
     }
   } else if (mode === 'feed') {
     awemes = await listPage(b, 'https://www.douyin.com/?recommend=1', u => u.includes('/module/feed'), 'feed');
+  } else if (mode === 'websearch') {
+    const kw = positional.join(' ');
+    if (!kw) throw new Error('用法: node douyin.mjs websearch <关键词>');
+    awemes = await webSearch(b, kw);
   } else if (mode === 'search') {
     const kw = positional.join(' ');
     if (!kw) throw new Error('用法: node.exe douyin.mjs search <关键词>');
     awemes = await listPage(b, `https://www.douyin.com/search/${encodeURIComponent(kw)}?type=video`,
       u => /\/search\//.test(u), 'search');
   } else {
-    throw new Error('模式: video | feed | search');
+    throw new Error('模式: video | feed | websearch | search');
   }
 
   const items = awemes.map(summarize);
