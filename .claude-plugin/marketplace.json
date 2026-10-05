@@ -1,0 +1,16 @@
+{
+  "name": "douyin-fetch",
+  "owner": {
+    "name": "Cznorth"
+  },
+  "metadata": {
+    "description": "抖音视频获取 skill：按链接下载、抓取推荐流、关键词搜索"
+  },
+  "plugins": [
+    {
+      "name": "douyin-fetch",
+      "source": "./",
+      "description": "获取/下载抖音视频：按链接下载、抓取推荐流、关键词搜索"
+    }
+  ]
+}
